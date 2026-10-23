@@ -1,20 +1,12 @@
 """Testy automatyczne IT Ticket Service.
 
-Każdy test startuje z własnej, świeżej instancji aplikacji (create_app()),
-więc testy nie zależą od siebie ani od kolejności wykonania.
+Każdy test dostaje świeżą aplikację z osobną bazą w tmp_path i atrapą Redis
+(fixture `client` w conftest.py), więc testy nie zależą od siebie.
 """
+
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
-
-from app.main import create_app
-
-
-@pytest.fixture()
-def client() -> TestClient:
-    app = create_app()
-    return TestClient(app)
 
 
 def test_health_returns_ok_and_service_name(client: TestClient) -> None:
@@ -87,9 +79,7 @@ def test_valid_status_transition_is_applied(client: TestClient) -> None:
     tickets = client.get("/tickets").json()
     new_ticket = next(t for t in tickets if t["status"] == "new")
 
-    response = client.patch(
-        f"/tickets/{new_ticket['id']}/status", json={"status": "in_progress"}
-    )
+    response = client.patch(f"/tickets/{new_ticket['id']}/status", json={"status": "in_progress"})
     assert response.status_code == 200
     assert response.json()["status"] == "in_progress"
 
@@ -100,9 +90,7 @@ def test_business_rule_blocks_closed_to_in_progress_without_state_change(
     tickets = client.get("/tickets").json()
     resolved_ticket = next(t for t in tickets if t["status"] == "resolved")
 
-    closed = client.patch(
-        f"/tickets/{resolved_ticket['id']}/status", json={"status": "closed"}
-    )
+    closed = client.patch(f"/tickets/{resolved_ticket['id']}/status", json={"status": "closed"})
     assert closed.status_code == 200
     assert closed.json()["status"] == "closed"
 
@@ -120,9 +108,7 @@ def test_unknown_status_value_returns_422(client: TestClient) -> None:
     tickets = client.get("/tickets").json()
     ticket_id = tickets[0]["id"]
 
-    response = client.patch(
-        f"/tickets/{ticket_id}/status", json={"status": "archived"}
-    )
+    response = client.patch(f"/tickets/{ticket_id}/status", json={"status": "archived"})
     assert response.status_code == 422
 
 

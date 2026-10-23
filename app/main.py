@@ -1,204 +1,193 @@
 """IT Ticket Service — mikrousługa obsługująca zgłoszenia IT.
 
-Dane przechowywane są w pamięci procesu (patrz TicketStore) i są tracone
-przy restarcie serwera — zgodnie z zakresem LAB1.
+LAB2: dane w SQLite (SQLAlchemy), odczyt szczegółów zgłoszenia przez cache-aside w Redis.
+Kontrakt API, identyfikatory i kody błędów są takie same jak w LAB1.
 """
 
 from __future__ import annotations
 
-import itertools
-from datetime import datetime, timezone
-from enum import Enum
+import logging
+import os
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+from redis import Redis
+from redis.exceptions import RedisError
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
-SERVICE_NAME = "it-ticket-service"
+from app import db_models  # noqa: F401  (rejestruje tabele w Base.metadata)
+from app.cache import BYPASS, HIT, MISS, JsonCache, make_redis
+from app.database import Base, make_database
+from app.models import (
+    SERVICE_NAME,
+    StatusUpdate,
+    Ticket,
+    TicketCreate,
+    parse_ticket_id,
+)
+from app.repository import TicketNotFound, TicketRepository
 
+logger = logging.getLogger("app.main")
 
-class TicketPriority(str, Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
-
-class TicketStatus(str, Enum):
-    new = "new"
-    in_progress = "in_progress"
-    resolved = "resolved"
-    closed = "closed"
-
-
-ALLOWED_TRANSITIONS: dict[TicketStatus, set[TicketStatus]] = {
-    TicketStatus.new: {TicketStatus.new, TicketStatus.in_progress},
-    TicketStatus.in_progress: {TicketStatus.in_progress, TicketStatus.resolved},
-    TicketStatus.resolved: {
-        TicketStatus.resolved, 
-        TicketStatus.in_progress,
-        TicketStatus.closed
-    },
-    TicketStatus.closed: {TicketStatus.closed, TicketStatus.new},
-}
+DEFAULT_DATABASE_URL = "sqlite:///./app.db"
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+DEFAULT_CACHE_PREFIX = f"lab2:{SERVICE_NAME}"
+DEFAULT_CACHE_TTL_SECONDS = 60
 
 
-class TicketCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
-    description: str = Field(min_length=1, max_length=2000)
-    reporter: str = Field(min_length=1, max_length=80)
-    priority: TicketPriority = Field(default=TicketPriority.medium)
-    assignee: str | None = Field(default=None, max_length=80)
-
-class StatusUpdate(BaseModel):
-    status: TicketStatus
+def _not_found(ticket_id: str) -> HTTPException:
+    return HTTPException(status_code=404, detail=f"Zgłoszenie o ID '{ticket_id}' nie istnieje.")
 
 
-class Ticket(BaseModel):
-    id: str
-    title: str
-    description: str
-    reporter: str
-    priority: TicketPriority
-    assignee: str | None
-    status: TicketStatus
-    created_at: datetime
-    updated_at: datetime
+def create_app(
+    database_url: str | None = None,
+    redis_client: Redis | None = None,
+) -> FastAPI:
+    """Fabryka aplikacji. Argumenty pozwalają testom wskazać osobną bazę i atrapę Redis.
 
-class TicketStore:
-    """Magazyn zgłoszeń w pamięci — jedna instancja na jedną instancję aplikacji."""
-    def __init__(self):
-        self._tickets: dict[str, Ticket] = {}
-        self._id_counter = itertools.count(1)
-        self._seed()
+    Zasoby (silnik, klient Redis) powstają w lifespan i są zamykane przy zatrzymaniu;
+    aplikacja przejmuje odpowiedzialność za zamknięcie także wstrzykniętego klienta.
+    """
 
-    def _next_id(self) -> int:
-        return f"TCK-{next(self._id_counter):04d}"
-
-    def _seed(self) -> None:
-        now = datetime.now(timezone.utc)
-        for ticket in (
-            Ticket(
-                id=self._next_id(),
-                title="Drukarka nie drukuje w sali 204",
-                description=(
-                    "Drukarka sieciowa zgłasza błąd offline po aktualizacji sterownika."
-                ),
-                reporter="jan.kowalski@uczelnia.pl",
-                priority=TicketPriority.medium,
-                assignee=None,
-                status=TicketStatus.new,
-                created_at=now,
-                updated_at=now,
-            ),
-            Ticket(
-                id=self._next_id(),
-                title="Brak dostępu do VPN",
-                description="Użytkownik nie może połączyć się z VPN uczelnianym od wczoraj.",
-                reporter="anna.nowak@uczelnia.pl",
-                priority=TicketPriority.high,
-                assignee="admin.it@uczelnia.pl",
-                status=TicketStatus.resolved,
-                created_at=now,
-                updated_at=now,
-            ),
-        ):
-            self._tickets[ticket.id] = ticket
-
-    def list_tickets(self) -> list[Ticket]:
-        return list(self._tickets.values())
-
-    def get(self, ticket_id: str) -> Ticket | None:
-        return self._tickets.get(ticket_id)
-
-    def create(self, data: TicketCreate) -> Ticket:
-        now = datetime.now(timezone.utc)
-        ticket = Ticket(
-            id=self._next_id(),
-            title=data.title,
-            description=data.description,
-            reporter=data.reporter,
-            priority=data.priority,
-            assignee=data.assignee,
-            status=TicketStatus.new,
-            created_at=now,
-            updated_at=now,
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        engine, sessions = make_database(
+            database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
         )
-        self._tickets[ticket.id] = ticket
-        return ticket
-
-    def update_status(self, ticket_id: str, new_status: TicketStatus) -> Ticket:
-        ticket = self._tickets[ticket_id]
-        allowed = ALLOWED_TRANSITIONS[ticket.status]
-        if new_status not in allowed:
-            raise ValueError(
-                f"Nie można zmienić statusu z '{ticket.status.value}' "
-                f"na '{new_status.value}'."
+        client = None
+        try:
+            client = (
+                redis_client
+                if redis_client is not None
+                else make_redis(os.getenv("REDIS_URL", DEFAULT_REDIS_URL))
             )
-        updated = ticket.model_copy(
-            update={"status": new_status, "updated_at": datetime.now(timezone.utc)}
-        )
-        self._tickets[ticket_id] = updated
-        return updated
 
+            Base.metadata.create_all(engine)
+            repository = TicketRepository(sessions)
+            repository.seed_if_empty()
+            app.state.engine = engine
+            app.state.redis = client
+            app.state.repository = repository
+            app.state.cache = JsonCache(
+                client,
+                prefix=os.getenv("CACHE_PREFIX", DEFAULT_CACHE_PREFIX),
+                ttl=int(os.getenv("CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL_SECONDS)),
+                resource_name="ticket",
+            )
+            yield
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            finally:
+                engine.dispose()
 
-def create_app() -> FastAPI:
     app = FastAPI(
-        title=SERVICE_NAME,
-        description="Mikrousługa obsługująca zgłoszenia IT (helpdesk).",
+        title=SERVICE_NAME, 
+        description="Mikrousługa obsługująca zgłoszenia IT (LAB2 — PAWOoM).",
+        lifespan=lifespan
     )
-    app.state.store = TicketStore()
 
-    def get_store(request: Request) -> TicketStore:
-        return request.app.state.store
+    def get_repository(request: Request) -> TicketRepository:
+        return request.app.state.repository
+
+    def get_cache(request: Request) -> JsonCache:
+        return request.app.state.cache
 
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": SERVICE_NAME}
 
+    @app.get("/ready")
+    def ready(request: Request) -> JSONResponse:
+        """Gotowość: baza jest wymagana (503), cache opcjonalny (degraded, 200)."""
+        try:
+            with request.app.state.engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            db_ok = True
+        except SQLAlchemyError:
+            db_ok = False
+        try:
+            cache_ok = bool(request.app.state.redis.ping())
+        except RedisError:
+            cache_ok = False
+        status = "ok" if (db_ok and cache_ok) else ("degraded" if db_ok else "error")
+        return JSONResponse(
+            status_code=200 if db_ok else 503,
+            content={
+                "service": SERVICE_NAME,
+                "status": status,
+                "database": "ok" if db_ok else "down",
+                "cache": "ok" if cache_ok else "down",
+            },
+        )
+
     @app.get("/tickets", response_model=list[Ticket])
-    def list_tickets(store: TicketStore = Depends(get_store)) -> list[Ticket]:
-        return store.list_tickets()
+    def list_tickets(repo: TicketRepository = Depends(get_repository)) -> list[Ticket]:
+        return repo.list()
 
     @app.get("/tickets/{ticket_id}", response_model=Ticket)
-    def get_ticket(ticket_id: str, store: TicketStore = Depends(get_store)) -> Ticket:
-        ticket = store.get(ticket_id)
-        if ticket is None:
-            raise HTTPException(
-                status_code=404, detail=f"Zgłoszenie o ID '{ticket_id}' nie istnieje."
-            )
-        return ticket
+    def get_ticket(
+        ticket_id: str,
+        response: Response,
+        repo: TicketRepository = Depends(get_repository),
+        cache: JsonCache = Depends(get_cache),
+    ) -> dict:
+        # ID spoza formatu TCK-0001 nie istnieje — nie dotykamy ani cache, ani bazy.
+        if parse_ticket_id(ticket_id) is None:
+            raise _not_found(ticket_id)
+
+        cached, source = cache.get(ticket_id)
+        if cached is not None:
+            try:
+                Ticket.model_validate(cached)
+            except ValidationError:
+                logger.warning("cache: wpis %s niezgodny ze schematem — MISS", ticket_id)
+                cache.delete(ticket_id)
+                cached, source = None, MISS
+        if cached is not None:
+            response.headers["X-Cache"] = HIT
+            return cached
+
+        try:
+            ticket = repo.get(ticket_id)
+        except TicketNotFound as exc:
+            raise _not_found(ticket_id) from exc  # 404 nie trafia do cache
+
+        payload = ticket.model_dump(mode="json")
+        if source != BYPASS and not cache.put(ticket_id, payload):
+            source = BYPASS
+        response.headers["X-Cache"] = source
+        return payload
 
     @app.post("/tickets", response_model=Ticket, status_code=201)
     def create_ticket(
-        data: TicketCreate, store: TicketStore = Depends(get_store)
+        data: TicketCreate, repo: TicketRepository = Depends(get_repository)
     ) -> Ticket:
-        return store.create(data)
+        ticket = repo.create(data)
+        return ticket
 
     @app.patch("/tickets/{ticket_id}/status", response_model=Ticket)
     def update_ticket_status(
         ticket_id: str,
         data: StatusUpdate,
-        store: TicketStore = Depends(get_store)
+        repo: TicketRepository = Depends(get_repository),
+        cache: JsonCache = Depends(get_cache),
     ) -> Ticket:
-        if store.get(ticket_id) is None:
-            raise HTTPException(
-                status_code=404, detail=f"Zgłoszenie o ID '{ticket_id}' nie istnieje."
-            )
+        # 1. Reguła + zapis + COMMIT w bazie (wyjątek = rollback, cache nietknięty).
         try:
-            return store.update_status(ticket_id, data.status)
-        except ValueError as e:
-            raise HTTPException(status_code=409, detail=str(e)) from e
-    
+            updated = repo.update_status(ticket_id, data.status)
+        except TicketNotFound as exc:
+            raise _not_found(ticket_id) from exc
+        except ValueError as exc:  # InvalidTransition, ConcurrentUpdate
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # 2. Unieważnienie dopiero po commicie; awaria Redis nie cofa zapisu.
+        cache.delete(ticket_id)
+        return updated
+
     return app
 
-
 app = create_app()
-
-
-# TODO:
-# 1. Choose your domain and name the service.
-# 2. Add your domain models.
-# 3. Add one list endpoint and one detail endpoint.
-# 4. Add one create or update endpoint.
-# 5. Add a business rule beyond types, required fields and unique identifiers.
-# 6. Reject invalid operations before changing state; handle 404, 409 and 422.
-# 7. Add at least three domain tests with fresh application state for each test.
-# 8. Verify write/read and restart via HTTP; complete the README.
